@@ -64,14 +64,40 @@ jobs:
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache
           sudo apt-get update -qq
-          sudo apt-get install -y -qq aria2 erofs-utils android-tools-fsutils e2fsprogs \
+          sudo apt-get install -y -qq aria2 erofs-utils e2fsprogs \
             rsync attr xz-utils p7zip-full unzip file python3 xxd
           sudo mkdir -p "$WORK"/{dl,vendor,src,out,mnt_v,mnt_s,mnt_o}
           sudo chown -R "$USER" "$WORK"
           mkfs.erofs --version || true
+          cat > "$WORK/unsparse.py" <<'PYU'
+          import struct, sys
+          src, dst = sys.argv[1], sys.argv[2]
+          with open(src, "rb") as f, open(dst, "wb") as o:
+              magic, major, minor, fhs, chs, blk, tblks, tchunks, crc = struct.unpack("<IHHHHIIII", f.read(28))
+              assert magic == 0xED26FF3A, "not a sparse image"
+              f.seek(fhs)
+              for _ in range(tchunks):
+                  ctype, _r, csz, tsz = struct.unpack("<HHII", f.read(12))
+                  n = csz * blk
+                  if ctype == 0xCAC1:
+                      left = n
+                      while left:
+                          b = f.read(min(left, 1 << 24)); o.write(b); left -= len(b)
+                  elif ctype == 0xCAC2:
+                      pat = f.read(4) * (blk // 4)
+                      for _ in range(csz):
+                          o.write(pat)
+                  elif ctype == 0xCAC3:
+                      o.seek(n, 1)
+                  elif ctype == 0xCAC4:
+                      f.read(4)
+                  else:
+                      raise SystemExit("unknown chunk type %x" % ctype)
+              o.truncate(tblks * blk)
+          PYU
           cat > "$WORK/lib.sh" <<'LIB'
           unsparse() { # in out
-            if [ "$(head -c4 "$1" | xxd -p)" = "3aff26ed" ]; then simg2img "$1" "$2"; rm -f "$1"; else mv -f "$1" "$2"; fi
+            if [ "$(head -c4 "$1" | xxd -p)" = "3aff26ed" ]; then python3 "$WORK/unsparse.py" "$1" "$2"; rm -f "$1"; else mv -f "$1" "$2"; fi
           }
           fstype() {
             if [ "$(dd if="$1" bs=1 skip=1024 count=4 2>/dev/null | xxd -p)" = "e2e1f5e0" ]; then echo erofs
@@ -284,4 +310,3 @@ jobs:
             /work/out/FLASH.txt
           compression-level: 0
           retention-days: 7
-
