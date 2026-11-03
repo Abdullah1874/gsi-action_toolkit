@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       gsi_url:
-        description: 'Direct GitHub Release URL for Doze-off crDroid 12 (.img.xz / .zip)'
+        description: 'Direct GitHub Release URL (.img.xz / .zip)'
         required: true
         type: string
 
@@ -42,10 +42,15 @@ jobs:
 
           echo "=== Extracting EXT4 Image ==="
           cd work
-          7z x archive -y || xz -dc -T0 archive > system.img
-          rm -f archive
-          IMG_FILE=$(find . -maxdepth 2 -type f -name "*.img" | head -n 1)
-          mv "$IMG_FILE" ../ext4.img
+          if file archive | grep -qi "XZ compressed"; then
+            xz -dc -T0 archive > ../ext4.img
+            rm -f archive
+          else
+            7z x archive -y
+            rm -f archive
+            IMG_FILE=$(find . -maxdepth 2 -type f -size +500M | head -n 1)
+            mv "$IMG_FILE" ../ext4.img
+          fi
           cd ..
           rm -rf work
 
@@ -54,6 +59,7 @@ jobs:
             simg2img ext4.img raw.img
             mv raw.img ext4.img
           fi
+          ls -lh ext4.img
 
       - name: Build Kernel 5.15+ Optimized EROFS Image
         run: |
@@ -61,7 +67,10 @@ jobs:
           sudo mount -t ext4 -o loop,ro ext4.img mnt
 
           echo "=== Compiling EROFS with LZ4HC Level 12 and 64K Pclusters ==="
-          sudo mkfs.erofs -zlz4hc,12 -C65536 -Eztailpacking,fragments,dedupe -T 1230768000 --mount-point=/ output/crDroid-12-EROFS-Performance.img mnt
+          if ! sudo mkfs.erofs -zlz4hc,12 -C65536 -Eztailpacking,fragments,dedupe -T 1230768000 --mount-point=/ output/crDroid-12-EROFS-Performance.img mnt; then
+            echo "=== Fallback: Using standard Ubuntu 24.04 erofs-utils flags ==="
+            sudo mkfs.erofs -zlz4hc,12 -C65536 -Eztailpacking -T 1230768000 --mount-point=/ output/crDroid-12-EROFS-Performance.img mnt
+          fi
 
           sudo umount mnt
           rm -f ext4.img
