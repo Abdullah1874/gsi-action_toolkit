@@ -111,24 +111,19 @@ jobs:
 
           sudo setfattr -n security.selinux -v "$ORIG_CTX" "$SYS_ROOT/build.prop"
 
-      - name: Extract 1:1 SELinux & UID/GID Map and Build EROFS
+       - name: Extract File Contexts and Build EROFS
         run: |
-          echo "=== Extracting Exact Original SELinux xattrs & Permissions from EXT4 Image ==="
+          echo "=== Extracting Android SELinux Contexts from EXT4 Image ==="
           sudo python3 - << 'EOF'
-          import os, re, stat
+          import os, re
 
           root_dir = "mnt_gsi"
-          fs_config_lines = []
           fc_lines = []
 
           for dirpath, dirnames, filenames in os.walk(root_dir):
               rel_dir = os.path.relpath(dirpath, root_dir)
-              items = [ (dirpath, rel_dir) ] + [ (os.path.join(dirpath, f), os.path.join(rel_dir, f) if rel_dir != "." else f) for f in filenames ]
+              items = [ (dirpath, rel_dir) ] + [ (os.path.join(dirpath, f), os.path.join(rel_dir, f) if dirpath != "." else f) for f in filenames ]
               for full_path, rel_path in items:
-                  st = os.lstat(full_path)
-                  mode = stat.S_IMODE(st.st_mode)
-                  uid = st.st_uid
-                  gid = st.st_gid
                   try:
                       raw_ctx = os.getxattr(full_path, b"security.selinux", follow_symlinks=False)
                       ctx = raw_ctx.decode("utf-8", errors="ignore").rstrip("\x00\n ")
@@ -136,19 +131,15 @@ jobs:
                       ctx = "u:object_r:system_file:s0"
 
                   if rel_path == ".":
-                      fs_config_lines.append(f"/ {uid} {gid} {mode:04o}\n")
                       fc_lines.append(f"/ {ctx}\n")
                   else:
                       clean_rel = rel_path.lstrip("./")
-                      fs_config_lines.append(f"{clean_rel} {uid} {gid} {mode:04o}\n")
                       escaped_path = "/" + re.escape(clean_rel)
                       fc_lines.append(f"{escaped_path} {ctx}\n")
 
-          with open("exact_fs_config", "w") as f:
-              f.writelines(fs_config_lines)
           with open("exact_file_contexts", "w") as f:
               f.writelines(fc_lines)
-          print(f"Captured {len(fc_lines)} exact Android SELinux contexts and UID/GID entries.")
+          print(f"Captured {len(fc_lines)} exact Android SELinux contexts.")
           EOF
 
           echo "=== Compiling Kernel 5.15 Compatible EROFS Image ==="
@@ -158,13 +149,12 @@ jobs:
             -Elegacy-compress \
             -T 1230768000 \
             --mount-point=/ \
-            --fs-config-file=exact_fs_config \
             --file-contexts=exact_file_contexts \
             output/system.img \
             mnt_gsi
 
           sudo umount mnt_gsi
-          rm -f ext4.img exact_fs_config exact_file_contexts
+          rm -f ext4.img exact_file_contexts
           sudo chown -R $USER:$USER output/
           ls -lh output/system.img
 
