@@ -1,172 +1,286 @@
-name: Perfect Realme Note 50 EROFS GSI Builder
+name: RMX3834 GSI builder
+
+# Put this file at .github/workflows/rmx3834-gsi.yml
+# Optional files in the repo (only read when the matching switch is on):
+#   rmx3834/system.prop   -> lines appended to system build.prop (extra_props)
+#   rmx3834/debloat.txt   -> exact paths relative to /system, one per line (debloat)
 
 on:
   workflow_dispatch:
     inputs:
       gsi_url:
-        description: 'Direct GitHub Release URL for crDroid 12 GSI (.img.xz)'
+        description: "Direct link to GSI (.img, .img.xz, .zip, .7z, .gz)"
         required: true
         type: string
+      out_fs:
+        description: "Output filesystem"
+        type: choice
+        options: [erofs, ext4]
+        default: erofs
+      strip_old_vndk:
+        description: "Remove VNDK v28-v32 apexes (your vendor is VNDK 33)"
+        type: boolean
+        default: false
+      strip_cjk_fonts:
+        description: "Remove CJK fonts AND their fonts.xml entries (keeps Bengali)"
+        type: boolean
+        default: false
+      extra_props:
+        description: "Append rmx3834/system.prop to build.prop"
+        type: boolean
+        default: false
+      debloat:
+        description: "Delete exact paths listed in rmx3834/debloat.txt"
+        type: boolean
+        default: false
+      pin_vendor_fingerprint:
+        description: "Optional: abort unless vendor.img has this ro.vendor.build.fingerprint"
+        type: string
+        default: ""
+      max_size_mb:
+        description: "Abort if system.img is bigger than this (0 = skip). Get your limit from lpdump."
+        type: string
+        default: "0"
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  DEVICE_TAG: device-Realme-Note-50
+  WORK: /work
 
 jobs:
-  build_erofs:
+  build:
     runs-on: ubuntu-24.04
+    timeout-minutes: 120
     steps:
-      - name: Free Runner Disk Space
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc "/usr/local/share/boost"
+      - uses: actions/checkout@v4
 
-      - name: Install Build Tools
+      - name: Free disk and install tools
         run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache
           sudo apt-get update -qq
-          sudo apt-get install -y -qq \
-            aria2 \
-            erofs-utils \
-            android-sdk-libsparse-utils \
-            xz-utils \
-            p7zip-full \
-            e2fsprogs \
-            attr \
-            python3 \
-            file
+          sudo apt-get install -y -qq aria2 erofs-utils android-tools-fsutils e2fsprogs \
+            rsync attr xz-utils p7zip-full unzip file python3 xxd
+          sudo mkdir -p "$WORK"/{dl,vendor,src,out,mnt_v,mnt_s,mnt_o}
+          sudo chown -R "$USER" "$WORK"
+          mkfs.erofs --version || true
+          cat > "$WORK/lib.sh" <<'LIB'
+          unsparse() { # in out
+            if [ "$(head -c4 "$1" | xxd -p)" = "3aff26ed" ]; then simg2img "$1" "$2"; rm -f "$1"; else mv -f "$1" "$2"; fi
+          }
+          fstype() {
+            if [ "$(dd if="$1" bs=1 skip=1024 count=4 2>/dev/null | xxd -p)" = "e2e1f5e0" ]; then echo erofs
+            elif [ "$(dd if="$1" bs=1 skip=1080 count=2 2>/dev/null | xxd -p)" = "53ef" ]; then echo ext4
+            else echo unknown; fi
+          }
+          mount_img() { # img dir
+            local t; t="$(fstype "$1")"
+            case "$t" in
+              erofs) sudo mount -t erofs -o ro,loop "$1" "$2" ;;
+              ext4)  sudo mount -t ext4 -o ro,loop,noload "$1" "$2" ;;
+              *) echo "Unknown filesystem in $1"; return 1 ;;
+            esac
+          }
+          LIB
 
-      - name: Download & Extract Base EXT4 GSI
+      # ---------- 1. Check your real vendor ----------
+      - name: Check vendor.img from the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PIN: ${{ inputs.pin_vendor_fingerprint }}
         run: |
-          mkdir -p work mnt_gsi output
-          aria2c -x16 -s16 -k1M --file-allocation=none -o work/archive "${{ inputs.gsi_url }}"
-
-          if file work/archive | grep -qi "HTML"; then
-            echo "ERROR: Downloaded an HTML webpage instead of the GSI file!"
-            exit 1
+          source "$WORK/lib.sh"
+          gh release download "$DEVICE_TAG" --repo "$GITHUB_REPOSITORY" -p 'vendor.img' -D "$WORK/vendor"
+          unsparse "$WORK/vendor/vendor.img" "$WORK/vendor/vendor.raw"
+          mount_img "$WORK/vendor/vendor.raw" "$WORK/mnt_v"
+          BP="$WORK/mnt_v/build.prop"
+          VNDK="$(grep -h '^ro.vndk.version=' "$BP" | head -1 | cut -d= -f2)"
+          VFP="$(grep -h '^ro.vendor.build.fingerprint=' "$BP" | head -1 | cut -d= -f2)"
+          echo "vendor VNDK: $VNDK"
+          echo "vendor fingerprint: $VFP"
+          {
+            echo "### Vendor"
+            echo "- VNDK: \`$VNDK\`"
+            echo "- Fingerprint: \`$VFP\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          [ "$VNDK" = "33" ] || { echo "::error::Vendor VNDK is '$VNDK', expected 33"; exit 1; }
+          if [ -n "$PIN" ] && [ "$PIN" != "$VFP" ]; then
+            echo "::error::Vendor fingerprint does not match the pin"; exit 1
           fi
+          sudo umount "$WORK/mnt_v"
+          rm -f "$WORK/vendor/vendor.raw" "$WORK/vendor/vendor.img"
 
-          cd work
-          if file archive | grep -qi "XZ compressed"; then
-            xz -dc -T0 archive > ../ext4.img
-          else
-            7z x archive -y
-            IMG_FILE=$(find . -maxdepth 2 -type f -size +500M | head -n 1)
-            mv "$IMG_FILE" ../ext4.img
-          fi
-          cd ..
-          rm -rf work
-
-          if file ext4.img | grep -q "sparse"; then
-            simg2img ext4.img raw.img && mv raw.img ext4.img
-          fi
-
-      - name: Slim Bloat & Inject Realme Note 50 (RMX3834) Tuning
+      # ---------- 2. Get and unpack the GSI ----------
+      - name: Download and unpack GSI
+        env:
+          GSI_URL: ${{ inputs.gsi_url }}
         run: |
-          truncate -s +512M ext4.img
-          e2fsck -f -y ext4.img || true
-          resize2fs -f ext4.img
-          e2fsck -E unshare_blocks -f -y ext4.img || true
-          sudo mount -t ext4 -o loop,rw ext4.img mnt_gsi
-
-          SYS_ROOT="mnt_gsi/system"
-          [[ ! -d "$SYS_ROOT/app" && -d "mnt_gsi/app" ]] && SYS_ROOT="mnt_gsi"
-
-          echo "=== 1. Stripping ~450MB Unused Legacy VNDKs (v28-v32), CJK Fonts & Foreign Overlays ==="
-          for v in 28 29 30 31 32; do
-            sudo rm -rf "$SYS_ROOT/system_ext/apex/com.android.vndk.v${v}"* \
-                        "$SYS_ROOT/apex/com.android.vndk.v${v}"*
+          source "$WORK/lib.sh"
+          cd "$WORK/dl"
+          aria2c -x16 -s16 -k1M --allow-overwrite=true -o gsi.download "$GSI_URL"
+          mkdir -p x
+          case "$(file -b gsi.download)" in
+            Zip*)        unzip -o -q gsi.download -d x ;;
+            XZ*)         xz -dc gsi.download > x/system.img ;;
+            gzip*)       gzip -dc gsi.download > x/system.img ;;
+            7-zip*)      7z x -y -ox gsi.download >/dev/null ;;
+            *)           mv gsi.download x/system.img ;;
+          esac
+          rm -f gsi.download
+          # nested archives (e.g. .img.xz inside a zip)
+          for f in $(find x -type f \( -name '*.xz' -o -name '*.gz' \)); do
+            case "$f" in *.xz) xz -dk "$f" ;; *.gz) gzip -dk "$f" ;; esac
           done
+          IMG="$(find x -type f -iname '*.img' -printf '%s %p\n' | sort -rn | head -1 | cut -d' ' -f2-)"
+          [ -n "$IMG" ] || { echo "::error::No .img found in the download"; exit 1; }
+          echo "Using $IMG"
+          unsparse "$IMG" "$WORK/src/system.raw"
+          rm -rf x
+          echo "Source filesystem: $(fstype "$WORK/src/system.raw")"
 
-          # Remove 200MB+ Chinese/Japanese/Korean fonts (keeps English & Bengali NotoSansBengali intact)
-          sudo find "$SYS_ROOT/fonts" -type f \( -name "NotoSansCJK*" -o -name "NotoSerifCJK*" \) -delete 2>/dev/null || true
-          sudo rm -rf "$SYS_ROOT/recovery-from-boot.p" "$SYS_ROOT/bin/install-recovery.sh" 2>/dev/null || true
-
-          # Remove foreign brand overlays (keep Realme/Oppo/Unisoc/Sprd overlays!)
-          sudo find "$SYS_ROOT/product/overlay" -type f \( \
-            -iname "*xiaomi*" -o -iname "*redmi*" -o -iname "*poco*" -o \
-            -iname "*samsung*" -o -iname "*huawei*" -o -iname "*honor*" -o \
-            -iname "*asus*" -o -iname "*rog*" -o -iname "*lenovo*" -o \
-            -iname "*motorola*" -o -iname "*nokia*" -o -iname "*sony*" -o -iname "*lge*" \
-          \) -delete 2>/dev/null || true
-
-          echo "=== 2. Preserving Original build.prop SELinux Label & Injecting Realme Note 50 Props ==="
-          ORIG_CTX=$(sudo getfattr --only-values -n security.selinux "$SYS_ROOT/build.prop" 2>/dev/null | tr -d '\0' || echo "u:object_r:system_file:s0")
-
-          sudo tee -a "$SYS_ROOT/build.prop" > /dev/null << 'EOF'
-
-          # --- Realme Note 50 (RMX3834 - Unisoc T612) Hardware & Speed Patch ---
-          persist.sys.qcom-brightness=4095
-          persist.sys.phh.backlight.scale=1
-          ro.surface_flinger.use_content_detection_for_refresh_rate=false
-          debug.sf.latch_unsignaled=1
-          debug.sf.disable_backpressure=1
-          debug.sf.enable_hwc_vds=0
-          persist.sys.phh.disable_a2dp_offload=true
-          ro.telephony.sim_slots.count=2
-          persist.dbg.volte_avail_ovr=1
-          persist.dbg.vt_avail_ovr=1
-          persist.dbg.wfc_avail_ovr=1
-          dalvik.vm.heapstartsize=8m
-          dalvik.vm.heapgrowthlimit=256m
-          dalvik.vm.heapsize=512m
-          dalvik.vm.heaptargetutilization=0.75
-          dalvik.vm.heapminfree=2m
-          dalvik.vm.heapmaxfree=8m
-          EOF
-
-          sudo setfattr -n security.selinux -v "$ORIG_CTX" "$SYS_ROOT/build.prop"
-
-      - name: Extract File Contexts and Build EROFS
+      # ---------- 3. Copy tree with all xattrs (SELinux labels, capabilities) ----------
+      - name: Extract tree
         run: |
-          echo "=== Extracting Android SELinux Contexts from EXT4 Image ==="
-          sudo python3 - << 'EOF'
-          import os, re
+          source "$WORK/lib.sh"
+          mount_img "$WORK/src/system.raw" "$WORK/mnt_s"
+          sudo mkdir -p "$WORK/tree"
+          sudo rsync -aHAX --numeric-ids "$WORK/mnt_s"/ "$WORK/tree"/
+          sudo umount "$WORK/mnt_s"
+          rm -f "$WORK/src/system.raw"
+          T="$WORK/tree"
+          if [ -f "$T/system/build.prop" ]; then SYS="$T/system"; else SYS="$T"; fi
+          echo "T=$T" >> "$GITHUB_ENV"
+          echo "SYS=$SYS" >> "$GITHUB_ENV"
+          grep -h -E '^ro\.(system\.)?build\.(version\.release|version\.sdk|fingerprint)=' "$SYS/build.prop" | tee -a "$GITHUB_STEP_SUMMARY"
 
-          root_dir = "mnt_gsi"
-          fc_lines = []
-
-          for dirpath, dirnames, filenames in os.walk(root_dir):
-              rel_dir = os.path.relpath(dirpath, root_dir)
-              items = [ (dirpath, rel_dir) ] + [ (os.path.join(dirpath, f), os.path.join(rel_dir, f) if rel_dir != "." else f) for f in filenames ]
-              for full_path, rel_path in items:
-                  try:
-                      raw_ctx = os.getxattr(full_path, b"security.selinux", follow_symlinks=False)
-                      ctx = raw_ctx.decode("utf-8", errors="ignore").rstrip("\x00\n ")
-                  except Exception:
-                      ctx = "u:object_r:system_file:s0"
-
-                  if rel_path == ".":
-                      fc_lines.append(f"/ {ctx}\n")
-                  else:
-                      clean_rel = rel_path.lstrip("./")
-                      escaped_path = "/" + re.escape(clean_rel)
-                      fc_lines.append(f"{escaped_path} {ctx}\n")
-
-          with open("exact_file_contexts", "w") as f:
-              f.writelines(fc_lines)
-          print(f"Captured {len(fc_lines)} exact Android SELinux contexts.")
-          EOF
-
-          echo "=== Compiling Kernel 5.15 Compatible EROFS Image ==="
-          sudo mkfs.erofs \
-            -zlz4hc,9 \
-            -C4096 \
-            -Elegacy-compress \
-            -T 1230768000 \
-            --mount-point=/ \
-            --file-contexts=exact_file_contexts \
-            output/system.img \
-            mnt_gsi
-
-          sudo umount mnt_gsi
-          rm -f ext4.img exact_file_contexts
-          sudo chown -R $USER:$USER output/
-          ls -lh output/system.img
-
-      - name: Ultra-Compress for Small Wi-Fi Download
+      # ---------- 4. Optional tweaks, each one its own switch ----------
+      - name: Strip old VNDK apexes
+        if: ${{ inputs.strip_old_vndk }}
         run: |
-          cd output
-          xz -9e -T0 system.img
-          ls -lh system.img.xz
+          sudo find "$T" -path '*/apex/*' -regextype posix-extended \
+            -regex '.*/com\.android\.vndk\.v(28|29|30|31|32)(\.apex|\.capex)?$' \
+            -print -exec rm -rf {} + || true
 
-      - name: Upload Ready-to-Flash EROFS GSI
-        uses: actions/upload-artifact@v4
+      - name: Strip CJK fonts (files and XML references together)
+        if: ${{ inputs.strip_cjk_fonts }}
+        run: |
+          sudo python3 - "$SYS" <<'PY'
+          import os, sys
+          import xml.etree.ElementTree as ET
+          root = sys.argv[1]
+          fonts = os.path.join(root, "fonts")
+          etc = os.path.join(root, "etc")
+          gone = set()
+          for n in os.listdir(fonts):
+              if "cjk" in n.lower():
+                  os.remove(os.path.join(fonts, n)); gone.add(n)
+          print("removed font files:", sorted(gone))
+          for n in os.listdir(etc):
+              if "font" not in n.lower() or not n.endswith(".xml"):
+                  continue
+              p = os.path.join(etc, n)
+              tree = ET.parse(p)
+              changed = False
+              for fam in list(tree.getroot().iter("family")):
+                  for f in list(fam.findall("font")):
+                      if (f.text or "").strip() in gone:
+                          fam.remove(f); changed = True
+                  if not fam.findall("font"):
+                      tree.getroot().remove(fam); changed = True
+              if changed:
+                  tree.write(p, encoding="utf-8", xml_declaration=True)
+                  print("rewrote", p)
+          PY
+
+      - name: Append extra props
+        if: ${{ inputs.extra_props }}
+        run: |
+          test -f rmx3834/system.prop || { echo "::error::rmx3834/system.prop not found"; exit 1; }
+          { echo; echo "# --- rmx3834 extra props ---"; cat rmx3834/system.prop; } | sudo tee -a "$SYS/build.prop" >/dev/null
+
+      - name: Debloat exact paths
+        if: ${{ inputs.debloat }}
+        run: |
+          test -f rmx3834/debloat.txt || { echo "::error::rmx3834/debloat.txt not found"; exit 1; }
+          while IFS= read -r line; do
+            line="${line%%#*}"; line="$(echo "$line" | xargs)"
+            [ -z "$line" ] && continue
+            case "$line" in *..*|*'*'*|*'?'*|/*) echo "::warning::skipping unsafe line: $line"; continue ;; esac
+            if [ -e "$SYS/$line" ]; then sudo rm -rf "${SYS:?}/$line"; echo "removed $line"; else echo "::warning::not found: $line"; fi
+          done < rmx3834/debloat.txt
+
+      # ---------- 5. Build ----------
+      - name: Build image
+        env:
+          OUT_FS: ${{ inputs.out_fs }}
+        run: |
+          OUT="$WORK/out/system.img"
+          if [ "$OUT_FS" = "erofs" ]; then
+            # Flags match your kernel's probe: big_pcluster + compr_cfgs yes,
+            # ztailpacking / fragments / lzma no.
+            sudo mkfs.erofs -zlz4hc,12 -C16384 "$OUT" "$T"
+          else
+            SIZE=$(( $(sudo du -sm "$T" | cut -f1) * 106 / 100 + 96 ))
+            truncate -s "${SIZE}M" "$OUT"
+            sudo mke2fs -q -t ext4 -b 4096 -L system -m 0 -O ^has_journal -d "$T" "$OUT"
+            sudo e2fsck -fy "$OUT" || true
+            sudo resize2fs -M "$OUT"
+          fi
+          ls -l "$OUT"
+
+      # ---------- 6. Verify before upload ----------
+      - name: Verify image
+        env:
+          MAXMB: ${{ inputs.max_size_mb }}
+        run: |
+          source "$WORK/lib.sh"
+          OUT="$WORK/out/system.img"
+          BYTES=$(stat -c %s "$OUT")
+          if [ "$MAXMB" != "0" ] && [ "$BYTES" -gt $(( MAXMB * 1024 * 1024 )) ]; then
+            echo "::error::system.img is $((BYTES/1024/1024)) MB, limit is $MAXMB MB"; exit 1
+          fi
+          mount_img "$OUT" "$WORK/mnt_o"
+          # build.prop must be present
+          if [ -f "$WORK/mnt_o/system/build.prop" ]; then P="$WORK/mnt_o/system/build.prop"; else P="$WORK/mnt_o/build.prop"; fi
+          test -f "$P"
+          # security.* xattrs (SELinux labels, file capabilities) must match the tree we fed in
+          dump() { (cd "$1" && sudo getfattr -R -h -d -m '^security\.' . 2>/dev/null | LC_ALL=C sort); }
+          dump "$T" > "$WORK/a.txt"
+          dump "$WORK/mnt_o" > "$WORK/b.txt"
+          if diff -q "$WORK/a.txt" "$WORK/b.txt" >/dev/null; then
+            echo "security xattrs identical ($(wc -l < "$WORK/a.txt") lines)"
+          else
+            diff "$WORK/a.txt" "$WORK/b.txt" | head -40
+            echo "::error::security xattrs differ between tree and built image"; exit 1
+          fi
+          sudo umount "$WORK/mnt_o"
+          sha256sum "$OUT" | tee "$WORK/out/system.img.sha256"
+          {
+            echo "### Output"
+            echo "- Size: $((BYTES/1024/1024)) MB"
+            echo "- SHA256: \`$(cut -d' ' -f1 "$WORK/out/system.img.sha256")\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat > "$WORK/out/FLASH.txt" <<'TXT'
+          Flash (fastbootd, because system is a logical partition):
+            adb reboot fastboot
+            fastboot --disable-verity --disable-verification flash vbmeta_a vbmeta.img   # your stock vbmeta.img
+            fastboot flash system_a system.img
+            fastboot -w
+          Stock product, system_ext, odm and vendor are NOT touched.
+          Keep a stock system.img ready.
+          TXT
+
+      - uses: actions/upload-artifact@v4
         with:
-          name: crDroid-12-RealmeNote50-EROFS
-          path: output/system.img.xz
+          name: rmx3834-system
+          path: |
+            /work/out/system.img
+            /work/out/system.img.sha256
+            /work/out/FLASH.txt
           compression-level: 0
+          retention-days: 7
