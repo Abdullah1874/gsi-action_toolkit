@@ -1,57 +1,83 @@
-name: Direct EXT4 to EROFS Converter
+name: Speed-Tuned EROFS GSI Builder
 
 on:
   workflow_dispatch:
     inputs:
       gsi_url:
-        description: 'Direct Download URL of EXT4 GSI (.img.xz, .zip, or .gz)'
+        description: 'Direct GitHub Release URL for Doze-off crDroid 12 (.img.xz / .zip)'
         required: true
-        type: string
-      output_name:
-        description: 'Output GSI Name (without extension)'
-        required: true
-        default: 'GSI-EROFS'
         type: string
 
 jobs:
-  convert:
-    runs-on: ubuntu-latest
+  build_erofs:
+    runs-on: ubuntu-24.04
     steps:
       - name: Free Runner Disk Space
         run: |
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc "/usr/local/share/boost"
           df -h
 
-      - name: Install Conversion Tools
+      - name: Install Build Tools
         run: |
-          sudo apt-get update
-          sudo apt-get install -y aria2 erofs-utils android-sdk-libsparse-utils p7zip-full xz-utils e2fsprogs
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            aria2 \
+            erofs-utils \
+            android-sdk-libsparse-utils \
+            xz-utils \
+            p7zip-full \
+            e2fsprogs \
+            file
 
-      - name: Download & Extract GSI
+      - name: Download & Extract EXT4 GSI
         run: |
-          mkdir -p work && cd work
-          aria2c -x16 -s16 "${{ github.event.inputs.gsi_url }}" -o downloaded_gsi
-          7z x downloaded_gsi || xz -d downloaded_gsi || mv downloaded_gsi system.img
-          IMG_FILE=$(find . -maxdepth 2 -name "*.img" | head -n 1)
-          mv "$IMG_FILE" ../ext4.img
-          cd .. && rm -rf work
-          ls -lh ext4.img
+          mkdir -p work mnt output
+          echo "=== Downloading GSI via aria2c ==="
+          aria2c -x16 -s16 -k1M --file-allocation=none -o work/archive "${{ inputs.gsi_url }}"
 
-      - name: Convert EXT4 to EROFS (Preserving SELinux Contexts)
-        run: |
-          if file ext4.img | grep -q "sparse"; then
-            simg2img ext4.img raw.img && mv raw.img ext4.img
+          if file work/archive | grep -qi "HTML"; then
+            echo "ERROR: Downloaded a webpage instead of the GSI file. Provide a direct release URL."
+            exit 1
           fi
-          mkdir -p mnt
+
+          echo "=== Extracting EXT4 Image ==="
+          cd work
+          7z x archive -y || xz -dc -T0 archive > system.img
+          rm -f archive
+          IMG_FILE=$(find . -maxdepth 2 -type f -name "*.img" | head -n 1)
+          mv "$IMG_FILE" ../ext4.img
+          cd ..
+          rm -rf work
+
+          if file ext4.img | grep -q "sparse"; then
+            echo "=== Converting Sparse Image to Raw EXT4 ==="
+            simg2img ext4.img raw.img
+            mv raw.img ext4.img
+          fi
+
+      - name: Build Kernel 5.15+ Optimized EROFS Image
+        run: |
+          echo "=== Mounting EXT4 Source (Read-Only) ==="
           sudo mount -t ext4 -o loop,ro ext4.img mnt
-          sudo mkfs.erofs -zlz4hc,9 -T 1230768000 --mount-point=/ "${{ github.event.inputs.output_name }}.img" mnt
+
+          echo "=== Compiling EROFS with LZ4HC Level 12 and 64K Pclusters ==="
+          sudo mkfs.erofs -zlz4hc,12 -C65536 -Eztailpacking,fragments,dedupe -T 1230768000 --mount-point=/ output/crDroid-12-EROFS-Performance.img mnt
+
           sudo umount mnt
           rm -f ext4.img
-          xz -9 -T0 "${{ github.event.inputs.output_name }}.img"
-          ls -lh "${{ github.event.inputs.output_name }}.img.xz"
+          sudo chown -R $USER:$USER output/
+          ls -lh output/crDroid-12-EROFS-Performance.img
 
-      - name: Upload Converted EROFS GSI
+      - name: Compress for Fast Download
+        run: |
+          cd output
+          xz -6 -T0 crDroid-12-EROFS-Performance.img
+          sha256sum crDroid-12-EROFS-Performance* > sha256sum.txt
+          ls -lh
+
+      - name: Upload Performance EROFS GSI
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ github.event.inputs.output_name }}-EROFS
-          path: ${{ github.event.inputs.output_name }}.img.xz
+          name: crDroid-12-EROFS-Kernel515-Optimized
+          path: output/*
+          compression-level: 0
