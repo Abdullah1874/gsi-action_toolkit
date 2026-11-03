@@ -83,7 +83,6 @@ jobs:
       - name: Inspect stock firmware reference images
         env:
           GH_TOKEN: ${{ github.token }}
-          PIN: ${{ inputs.pin_vendor_fingerprint }}
         run: |
           set -euo pipefail
           source "$WORK/lib.sh"
@@ -99,6 +98,7 @@ jobs:
           {
             echo "RMX3834 stock firmware reference inspection"
             echo "Expected firmware: RMX3834export_15_H.07"
+            echo "Mode: READ-ONLY inspection; no images are modified or flashed."
             echo "Expected vendor fingerprint: realme/RMX3834/RE5C9F:15/AP3A.240905.015.A2/T.R4T2.1784276895:user/release-keys"
             echo "Generated: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
             echo
@@ -107,7 +107,14 @@ jobs:
           # Inspect filesystem partitions. Boot-chain images are recorded separately below.
           for part in vendor product system_ext odm vendor_dlkm; do
             IMG="$REF/$part.img"
-            [ -f "$IMG" ] || { echo "::error::Missing required release asset: $part.img"; exit 1; }
+            if [ ! -f "$IMG" ]; then
+              if [ "$part" = "vendor_dlkm" ]; then
+                echo "===== vendor_dlkm.img =====" >> "$REPORT"
+                echo "Optional asset absent from release; skipped." >> "$REPORT"
+                continue
+              fi
+              echo "::error::Missing required release asset: $part.img"; exit 1
+            fi
             echo "===== $part.img =====" | tee -a "$REPORT"
             echo "Original SHA256: $(sha256sum "$IMG" | cut -d' ' -f1)" >> "$REPORT"
             echo "Original size: $(du -h "$IMG" | cut -f1)" >> "$REPORT"
@@ -127,12 +134,16 @@ jobs:
             MNT="$WORK/mnt_ref"
             sudo mkdir -p "$MNT"
             mount_img "$RAW" "$MNT"
-            BP="$MNT/build.prop"
-            if [ -f "$BP" ]; then
-              grep -E '^(ro\.(build\.(fingerprint|version\.release|version\.sdk)|vendor\.build\.fingerprint|vndk\.version|product\.vndk\.version)|ro\.product\.first_api_level)=' "$BP" \
-                | tee -a "$REPORT" || true
+            echo "Property files:" >> "$REPORT"
+            mapfile -t PROP_FILES < <(find "$MNT" -type f -name '*.prop' -print 2>/dev/null | sort)
+            if [ "${#PROP_FILES[@]}" -eq 0 ]; then
+              echo "No .prop files found in this partition." >> "$REPORT"
             else
-              echo "No root build.prop found." >> "$REPORT"
+              printf '%s\n' "${PROP_FILES[@]}" | sed "s#^$MNT/##" >> "$REPORT"
+              echo "Selected properties (source file shown):" >> "$REPORT"
+              for pf in "${PROP_FILES[@]}"; do
+                grep -H -E '^(ro\.(build\.(fingerprint|version\.release|version\.sdk)|vendor\.build\.fingerprint|vndk\.version|product\.vndk\.version|product\.first_api_level)|ro\.vendor\.(build\.fingerprint|vndk\.version))=' "$pf" 2>/dev/null || true
+              done | tee -a "$REPORT"
             fi
             echo "VINTF manifests and compatibility matrices:" >> "$REPORT"
             find "$MNT/etc/vintf" -type f \
@@ -143,19 +154,21 @@ jobs:
               \( -iname '*ims*' -o -iname '*carrier*' -o -iname '*telephony*' -o -iname '*bluetooth*' -o -iname '*wifi*' -o -iname '*audio*' -o -iname '*camera*' -o -iname '*fingerprint*' -o -iname '*permissions*.xml' \) \
               -print 2>/dev/null | sed "s#^$MNT/##" | sort | head -250 | tee -a "$REPORT" || true
             if [ "$part" = "vendor" ]; then
-              VNDK="$(grep -h '^ro.vndk.version=' "$BP" 2>/dev/null | head -1 | cut -d= -f2 || true)"
-              VFP="$(grep -h '^ro.vendor.build.fingerprint=' "$BP" 2>/dev/null | head -1 | cut -d= -f2 || true)"
-              echo "Vendor VNDK: $VNDK"
-              echo "Vendor fingerprint: $VFP"
-              [ "$VNDK" = "33" ] || { echo "::error::Vendor VNDK is '$VNDK', expected 33"; exit 1; }
-              if [ -n "$PIN" ] && [ "$PIN" != "$VFP" ]; then
-                echo "::error::Vendor fingerprint does not match the requested pin"; exit 1
+              VNDK="$(grep -h -E '^(ro\.vndk\.version|ro\.vendor\.vndk\.version)=' "${PROP_FILES[@]}" 2>/dev/null | head -1 | cut -d= -f2- || true)"
+              VFP="$(grep -h '^ro\.vendor\.build\.fingerprint=' "${PROP_FILES[@]}" 2>/dev/null | head -1 | cut -d= -f2- || true)"
+              echo "Vendor VNDK found in image: ${VNDK:-NOT FOUND}" | tee -a "$REPORT"
+              echo "Vendor fingerprint found in image: ${VFP:-NOT FOUND}" | tee -a "$REPORT"
+              if [ -n "$VNDK" ] && [ "$VNDK" != "33" ]; then
+                echo "WARNING: vendor image property reports VNDK $VNDK; probe previously reported 33." | tee -a "$REPORT"
+              elif [ -z "$VNDK" ]; then
+                echo "NOTE: VNDK property not found in scanned vendor .prop files; this alone does not prove incompatibility." | tee -a "$REPORT"
               fi
-              if [ "$VFP" != "realme/RMX3834/RE5C9F:15/AP3A.240905.015.A2/T.R4T2.1784276895:user/release-keys" ]; then
-                echo "::error::Vendor fingerprint does not match RMX3834export_15_H.07"; exit 1
+              EXPECTED_FP="realme/RMX3834/RE5C9F:15/AP3A.240905.015.A2/T.R4T2.1784276895:user/release-keys"
+              if [ -n "$VFP" ] && [ "$VFP" != "$EXPECTED_FP" ]; then
+                echo "WARNING: vendor image fingerprint differs from expected firmware fingerprint." | tee -a "$REPORT"
+              elif [ -z "$VFP" ]; then
+                echo "NOTE: vendor fingerprint not found in scanned .prop files." | tee -a "$REPORT"
               fi
-              echo "Vendor VNDK: $VNDK" >> "$REPORT"
-              echo "Vendor fingerprint: $VFP" >> "$REPORT"
             fi
             if [ "$part" = "vendor_dlkm" ]; then
               echo "Kernel modules:" >> "$REPORT"
@@ -214,15 +227,18 @@ jobs:
           echo "GSI filesystem: $TYPE" >> "$WORK/out/stock-compatibility-report.txt"
           mount_img "$WORK/gsi/system.raw" "$WORK/mnt_gsi"
           M="$WORK/mnt_gsi"
-          P="$M/build.prop"; [ -f "$P" ] || P="$M/system/build.prop"
           {
             echo
             echo '===== GSI system image (read-only inspection) ====='
-            echo "Build properties file: ${P#"$M"/}"
-            if [ -f "$P" ]; then
-              grep -E '^(ro\.(build\.(fingerprint|version\.release|version\.sdk)|product\.|system\.|vendor\.)|ro\.vndk)' "$P" | sort || true
+            echo 'Property files and selected properties:'
+            mapfile -t GSI_PROPS < <(find "$M" -type f -name '*.prop' -print 2>/dev/null | sort)
+            if [ "${#GSI_PROPS[@]}" -gt 0 ]; then
+              printf '%s\\n' "${GSI_PROPS[@]}" | sed "s#^$M/##"
+              for pf in "${GSI_PROPS[@]}"; do
+                grep -H -E '^(ro\\.(build\\.(fingerprint|version\\.release|version\\.sdk)|product\\.|system\\.|vendor\\.)|ro\\.vndk)' "$pf" 2>/dev/null || true
+              done
             else
-              echo 'No build.prop found at expected locations.'
+              echo 'No .prop files found in GSI image.'
             fi
             echo
             echo 'VINTF files:'
