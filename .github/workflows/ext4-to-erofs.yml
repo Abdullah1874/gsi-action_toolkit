@@ -1,1 +1,57 @@
+name: Direct EXT4 to EROFS Converter
 
+on:
+  workflow_dispatch:
+    inputs:
+      gsi_url:
+        description: 'Direct Download URL of EXT4 GSI (.img.xz, .zip, or .gz)'
+        required: true
+        type: string
+      output_name:
+        description: 'Output GSI Name (without extension)'
+        required: true
+        default: 'GSI-EROFS'
+        type: string
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free Runner Disk Space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+          df -h
+
+      - name: Install Conversion Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y aria2 erofs-utils android-sdk-libsparse-utils p7zip-full xz-utils e2fsprogs
+
+      - name: Download & Extract GSI
+        run: |
+          mkdir -p work && cd work
+          aria2c -x16 -s16 "${{ github.event.inputs.gsi_url }}" -o downloaded_gsi
+          7z x downloaded_gsi || xz -d downloaded_gsi || mv downloaded_gsi system.img
+          IMG_FILE=$(find . -maxdepth 2 -name "*.img" | head -n 1)
+          mv "$IMG_FILE" ../ext4.img
+          cd .. && rm -rf work
+          ls -lh ext4.img
+
+      - name: Convert EXT4 to EROFS (Preserving SELinux Contexts)
+        run: |
+          if file ext4.img | grep -q "sparse"; then
+            simg2img ext4.img raw.img && mv raw.img ext4.img
+          fi
+          mkdir -p mnt
+          sudo mount -t ext4 -o loop,ro ext4.img mnt
+          sudo mkfs.erofs -zlz4hc,9 -T 1230768000 --mount-point=/ "${{ github.event.inputs.output_name }}.img" mnt
+          sudo umount mnt
+          rm -f ext4.img
+          xz -9 -T0 "${{ github.event.inputs.output_name }}.img"
+          ls -lh "${{ github.event.inputs.output_name }}.img.xz"
+
+      - name: Upload Converted EROFS GSI
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.inputs.output_name }}-EROFS
+          path: ${{ github.event.inputs.output_name }}.img.xz
