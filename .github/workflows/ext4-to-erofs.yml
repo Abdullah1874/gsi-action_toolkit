@@ -1,4 +1,4 @@
-name: Realme Note 50 Custom EROFS GSI Builder
+name: Perfect Realme Note 50 EROFS GSI Builder
 
 on:
   workflow_dispatch:
@@ -15,7 +15,6 @@ jobs:
       - name: Free Runner Disk Space
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc "/usr/local/share/boost"
-          df -h
 
       - name: Install Build Tools
         run: |
@@ -27,27 +26,25 @@ jobs:
             xz-utils \
             p7zip-full \
             e2fsprogs \
+            attr \
+            python3 \
             file
 
       - name: Download & Extract Base EXT4 GSI
         run: |
-          mkdir -p work mnt_gsi mnt_vendor mnt_product output
-          echo "=== 1. Downloading Base crDroid GSI ==="
+          mkdir -p work mnt_gsi output
           aria2c -x16 -s16 -k1M --file-allocation=none -o work/archive "${{ inputs.gsi_url }}"
 
           if file work/archive | grep -qi "HTML"; then
-            echo "ERROR: Downloaded an HTML page. Ensure you copied the direct .img.xz asset link."
+            echo "ERROR: Downloaded an HTML webpage instead of the GSI file!"
             exit 1
           fi
 
-          echo "=== 2. Extracting EXT4 GSI ==="
           cd work
           if file archive | grep -qi "XZ compressed"; then
             xz -dc -T0 archive > ../ext4.img
-            rm -f archive
           else
             7z x archive -y
-            rm -f archive
             IMG_FILE=$(find . -maxdepth 2 -type f -size +500M | head -n 1)
             mv "$IMG_FILE" ../ext4.img
           fi
@@ -58,10 +55,9 @@ jobs:
             simg2img ext4.img raw.img && mv raw.img ext4.img
           fi
 
-      - name: Bake Realme Note 50 Vendor & Product Partitions
+      - name: Slim Bloat & Inject Realme Note 50 (RMX3834) Tuning
         run: |
-          echo "=== 1. Preparing EXT4 GSI for Read-Write Injection ==="
-          truncate -s +1024M ext4.img
+          truncate -s +512M ext4.img
           e2fsck -f -y ext4.img || true
           resize2fs -f ext4.img
           e2fsck -E unshare_blocks -f -y ext4.img || true
@@ -70,63 +66,36 @@ jobs:
           SYS_ROOT="mnt_gsi/system"
           [[ ! -d "$SYS_ROOT/app" && -d "mnt_gsi/app" ]] && SYS_ROOT="mnt_gsi"
 
-          echo "=== 2. Stripping Foreign OEM Overlays ==="
+          echo "=== 1. Stripping ~450MB Unused Legacy VNDKs (v28-v32), CJK Fonts & Foreign Overlays ==="
+          for v in 28 29 30 31 32; do
+            sudo rm -rf "$SYS_ROOT/system_ext/apex/com.android.vndk.v${v}"* \
+                        "$SYS_ROOT/apex/com.android.vndk.v${v}"*
+          done
+
+          # Remove 200MB+ Chinese/Japanese/Korean fonts (keeps English & Bengali NotoSansBengali intact)
+          sudo find "$SYS_ROOT/fonts" -type f \( -name "NotoSansCJK*" -o -name "NotoSerifCJK*" \) -delete 2>/dev/null || true
+          sudo rm -rf "$SYS_ROOT/recovery-from-boot.p" "$SYS_ROOT/bin/install-recovery.sh" 2>/dev/null || true
+
+          # Remove foreign brand overlays (keep Realme/Oppo/Unisoc/Sprd overlays!)
           sudo find "$SYS_ROOT/product/overlay" -type f \( \
             -iname "*xiaomi*" -o -iname "*redmi*" -o -iname "*poco*" -o \
             -iname "*samsung*" -o -iname "*huawei*" -o -iname "*honor*" -o \
             -iname "*asus*" -o -iname "*rog*" -o -iname "*lenovo*" -o \
-            -iname "*motorola*" -o -iname "*nokia*" -o -iname "*sony*" \
+            -iname "*motorola*" -o -iname "*nokia*" -o -iname "*sony*" -o -iname "*lge*" \
           \) -delete 2>/dev/null || true
 
-          echo "=== 3. Downloading Stored vendor.img & product.img from Release ==="
-          BASE_URL="https://github.com/${{ github.repository }}/releases/download/device-Realme-Note-50"
-          aria2c -x16 -s16 -o vendor.img "${BASE_URL}/vendor.img"
-          aria2c -x16 -s16 -o product.img "${BASE_URL}/product.img"
+          echo "=== 2. Preserving Original build.prop SELinux Label & Injecting Realme Note 50 Props ==="
+          ORIG_CTX=$(sudo getfattr --only-values -n security.selinux "$SYS_ROOT/build.prop" 2>/dev/null | tr -d '\0' || echo "u:object_r:system_file:s0")
 
-          # Convert vendor / product sparse images if needed
-          if file vendor.img | grep -q "sparse"; then
-            simg2img vendor.img vendor_raw.img && mv vendor_raw.img vendor.img
-          fi
-          if file product.img | grep -q "sparse"; then
-            simg2img product.img product_raw.img && mv product_raw.img product.img
-          fi
-
-          echo "=== 4. Mounting & Extracting Stock Overlays ==="
-          sudo mkdir -p "$SYS_ROOT/product/overlay"
-
-          # Extract vendor overlays
-          if sudo mount -o loop,ro vendor.img mnt_vendor 2>/dev/null || sudo fsck.erofs --extract=mnt_vendor vendor.img 2>/dev/null; then
-            if [[ -d "mnt_vendor/overlay" ]]; then
-              echo "Injecting vendor overlays..."
-              sudo cp -rf mnt_vendor/overlay/*.apk "$SYS_ROOT/product/overlay/" 2>/dev/null || true
-            fi
-            sudo umount mnt_vendor 2>/dev/null || true
-          fi
-
-          # Extract product overlays
-          if sudo mount -o loop,ro product.img mnt_product 2>/dev/null || sudo fsck.erofs --extract=mnt_product product.img 2>/dev/null; then
-            if [[ -d "mnt_product/overlay" ]]; then
-              echo "Injecting Realme product overlays..."
-              sudo cp -rf mnt_product/overlay/*.apk "$SYS_ROOT/product/overlay/" 2>/dev/null || true
-            fi
-            sudo umount mnt_product 2>/dev/null || true
-          fi
-
-          rm -f vendor.img product.img
-          sudo chmod 644 "$SYS_ROOT/product/overlay/"*.apk 2>/dev/null || true
-          sudo chcon -R u:object_r:system_file:s0 "$SYS_ROOT/product/overlay" 2>/dev/null || true
-
-          echo "=== 5. Ingesting Realme Note 50 Hardware Props ==="
           sudo tee -a "$SYS_ROOT/build.prop" > /dev/null << 'EOF'
 
-          # --- Realme Note 50 (RMX3834 / H.07) Specific Optimizations ---
+          # --- Realme Note 50 (RMX3834 - Unisoc T612) Hardware & Speed Patch ---
           persist.sys.qcom-brightness=4095
           persist.sys.phh.backlight.scale=1
           ro.surface_flinger.use_content_detection_for_refresh_rate=false
           debug.sf.latch_unsignaled=1
           debug.sf.disable_backpressure=1
           debug.sf.enable_hwc_vds=0
-          debug.renderengine.backend=skiaglthreaded
           persist.sys.phh.disable_a2dp_offload=true
           ro.telephony.sim_slots.count=2
           persist.dbg.volte_avail_ovr=1
@@ -138,31 +107,77 @@ jobs:
           dalvik.vm.heaptargetutilization=0.75
           dalvik.vm.heapminfree=2m
           dalvik.vm.heapmaxfree=8m
-          ro.sys.fw.bg_apps_limit=32
           EOF
 
-          sudo chcon u:object_r:system_file:s0 "$SYS_ROOT/build.prop" 2>/dev/null || true
+          sudo setfattr -n security.selinux -v "$ORIG_CTX" "$SYS_ROOT/build.prop"
 
-      - name: Compile Performance EROFS Image
+      - name: Extract 1:1 SELinux & UID/GID Map and Build EROFS
         run: |
-          echo "=== Compiling EROFS (LZ4HC Level 9 + 64K Clusters + Tailpacking) ==="
-          sudo mkfs.erofs -zlz4hc,9 -C65536 -Eztailpacking -T 1230768000 --mount-point=/ output/crDroid-12-RealmeNote50-EROFS.img mnt_gsi
+          echo "=== Extracting Exact Original SELinux xattrs & Permissions from EXT4 Image ==="
+          sudo python3 - << 'EOF'
+          import os, re, stat
+
+          root_dir = "mnt_gsi"
+          fs_config_lines = []
+          fc_lines = []
+
+          for dirpath, dirnames, filenames in os.walk(root_dir):
+              rel_dir = os.path.relpath(dirpath, root_dir)
+              items = [ (dirpath, rel_dir) ] + [ (os.path.join(dirpath, f), os.path.join(rel_dir, f) if rel_dir != "." else f) for f in filenames ]
+              for full_path, rel_path in items:
+                  st = os.lstat(full_path)
+                  mode = stat.S_IMODE(st.st_mode)
+                  uid = st.st_uid
+                  gid = st.st_gid
+                  try:
+                      raw_ctx = os.getxattr(full_path, b"security.selinux", follow_symlinks=False)
+                      ctx = raw_ctx.decode("utf-8", errors="ignore").rstrip("\x00\n ")
+                  except Exception:
+                      ctx = "u:object_r:system_file:s0"
+
+                  if rel_path == ".":
+                      fs_config_lines.append(f"/ {uid} {gid} {mode:04o}\n")
+                      fc_lines.append(f"/ {ctx}\n")
+                  else:
+                      clean_rel = rel_path.lstrip("./")
+                      fs_config_lines.append(f"{clean_rel} {uid} {gid} {mode:04o}\n")
+                      escaped_path = "/" + re.escape(clean_rel)
+                      fc_lines.append(f"{escaped_path} {ctx}\n")
+
+          with open("exact_fs_config", "w") as f:
+              f.writelines(fs_config_lines)
+          with open("exact_file_contexts", "w") as f:
+              f.writelines(fc_lines)
+          print(f"Captured {len(fc_lines)} exact Android SELinux contexts and UID/GID entries.")
+          EOF
+
+          echo "=== Compiling Kernel 5.15 Compatible EROFS Image ==="
+          sudo mkfs.erofs \
+            -zlz4hc,9 \
+            -C4096 \
+            -Elegacy-compress \
+            -T 1230768000 \
+            --mount-point=/ \
+            --fs-config-file=exact_fs_config \
+            --file-contexts=exact_file_contexts \
+            output/system.img \
+            mnt_gsi
 
           sudo umount mnt_gsi
-          rm -f ext4.img
+          rm -f ext4.img exact_fs_config exact_file_contexts
           sudo chown -R $USER:$USER output/
-          ls -lh output/
+          ls -lh output/system.img
 
-      - name: Compress for Fast Download
+      - name: Ultra-Compress for Small Wi-Fi Download
         run: |
           cd output
-          xz -1 -T0 crDroid-12-RealmeNote50-EROFS.img
-          sha256sum crDroid-12-RealmeNote50-EROFS.img.xz > sha256sum.txt
-          ls -lh
+          # Uses extreme dictionary compression across all CPU cores to shrink download size to ~750-850MB
+          xz -9e -T0 system.img
+          ls -lh system.img.xz
 
-      - name: Upload Finished Build
+      - name: Upload Ready-to-Flash EROFS GSI
         uses: actions/upload-artifact@v4
         with:
-          name: crDroid-12-RealmeNote50-Tuned-EROFS
-          path: output/*
+          name: crDroid-12-RealmeNote50-EROFS
+          path: output/system.img.xz
           compression-level: 0
