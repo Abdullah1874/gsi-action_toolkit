@@ -111,7 +111,7 @@ jobs:
 
           sudo setfattr -n security.selinux -v "$ORIG_CTX" "$SYS_ROOT/build.prop"
 
-       - name: Extract File Contexts and Build EROFS
+      - name: Extract File Contexts and Build EROFS
         run: |
           echo "=== Extracting Android SELinux Contexts from EXT4 Image ==="
           sudo python3 - << 'EOF'
@@ -122,7 +122,7 @@ jobs:
 
           for dirpath, dirnames, filenames in os.walk(root_dir):
               rel_dir = os.path.relpath(dirpath, root_dir)
-              items = [ (dirpath, rel_dir) ] + [ (os.path.join(dirpath, f), os.path.join(rel_dir, f) if dirpath != "." else f) for f in filenames ]
+              items = [ (dirpath, rel_dir) ] + [ (os.path.join(dirpath, f), os.path.join(rel_dir, f) if rel_dir != "." else f) for f in filenames ]
               for full_path, rel_path in items:
                   try:
                       raw_ctx = os.getxattr(full_path, b"security.selinux", follow_symlinks=False)
@@ -161,7 +161,6 @@ jobs:
       - name: Ultra-Compress for Small Wi-Fi Download
         run: |
           cd output
-          # Uses extreme dictionary compression across all CPU cores to shrink download size to ~750-850MB
           xz -9e -T0 system.img
           ls -lh system.img.xz
 
