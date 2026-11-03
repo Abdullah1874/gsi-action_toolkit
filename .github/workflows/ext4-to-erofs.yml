@@ -1,46 +1,12 @@
-name: RMX3834 GSI builder
-
-# Put this file at .github/workflows/rmx3834-gsi.yml
-# Optional files in the repo (only read when the matching switch is on):
-#   rmx3834/system.prop   -> lines appended to system build.prop (extra_props)
-#   rmx3834/debloat.txt   -> exact paths relative to /system, one per line (debloat)
+name: RMX3834 GSI compatibility report (report only)
 
 on:
   workflow_dispatch:
     inputs:
       gsi_url:
-        description: "Direct link to GSI (.img, .img.xz, .zip, .7z, .gz)"
+        description: "Direct link to the GSI image/archive (.img, .img.xz, .zip, .7z, .gz)"
         required: true
         type: string
-      out_fs:
-        description: "Output filesystem"
-        type: choice
-        options: [erofs, ext4]
-        default: erofs
-      strip_old_vndk:
-        description: "Remove VNDK v28-v32 apexes (your vendor is VNDK 33)"
-        type: boolean
-        default: false
-      strip_cjk_fonts:
-        description: "Remove CJK fonts AND their fonts.xml entries (keeps Bengali)"
-        type: boolean
-        default: false
-      extra_props:
-        description: "Append rmx3834/system.prop to build.prop"
-        type: boolean
-        default: false
-      debloat:
-        description: "Delete exact paths listed in rmx3834/debloat.txt"
-        type: boolean
-        default: false
-      pin_vendor_fingerprint:
-        description: "Optional: abort unless vendor.img has this ro.vendor.build.fingerprint"
-        type: string
-        default: ""
-      max_size_mb:
-        description: "Abort if system.img is bigger than this (0 = skip). Get your limit from lpdump."
-        type: string
-        default: "0"
 
 permissions:
   contents: read
@@ -54,12 +20,11 @@ env:
   WORK: /work
 
 jobs:
-  build:
+  report:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
-
       - name: Free disk and install tools
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache
@@ -114,199 +79,176 @@ jobs:
           }
           LIB
 
-      # ---------- 1. Check your real vendor ----------
-      - name: Check vendor.img from the release
+      # ---------- 1. Inspect stock RMX3834 reference images ----------
+      - name: Inspect stock firmware reference images
         env:
           GH_TOKEN: ${{ github.token }}
           PIN: ${{ inputs.pin_vendor_fingerprint }}
         run: |
+          set -euo pipefail
           source "$WORK/lib.sh"
-          gh release download "$DEVICE_TAG" --repo "$GITHUB_REPOSITORY" -p 'vendor.img' -D "$WORK/vendor"
-          unsparse "$WORK/vendor/vendor.img" "$WORK/vendor/vendor.raw"
-          mount_img "$WORK/vendor/vendor.raw" "$WORK/mnt_v"
-          BP="$WORK/mnt_v/build.prop"
-          VNDK="$(grep -h '^ro.vndk.version=' "$BP" | head -1 | cut -d= -f2)"
-          VFP="$(grep -h '^ro.vendor.build.fingerprint=' "$BP" | head -1 | cut -d= -f2)"
-          echo "vendor VNDK: $VNDK"
-          echo "vendor fingerprint: $VFP"
-          {
-            echo "### Vendor"
-            echo "- VNDK: \`$VNDK\`"
-            echo "- Fingerprint: \`$VFP\`"
-          } >> "$GITHUB_STEP_SUMMARY"
-          [ "$VNDK" = "33" ] || { echo "::error::Vendor VNDK is '$VNDK', expected 33"; exit 1; }
-          if [ -n "$PIN" ] && [ "$PIN" != "$VFP" ]; then
-            echo "::error::Vendor fingerprint does not match the pin"; exit 1
-          fi
-          sudo umount "$WORK/mnt_v"
-          rm -f "$WORK/vendor/vendor.raw" "$WORK/vendor/vendor.img"
+          REF="$WORK/ref"
+          REPORT="$WORK/out/stock-compatibility-report.txt"
+          mkdir -p "$REF" "$WORK/out"
+          : > "$REPORT"
+          gh release download "$DEVICE_TAG" --repo "$GITHUB_REPOSITORY" \
+            -p 'vendor.img' -p 'product.img' -p 'system_ext.img' -p 'odm.img' \
+            -p 'vendor_dlkm.img' -p 'boot.img' -p 'vendor_boot.img' -p 'dtbo.img' \
+            -D "$REF"
 
-      # ---------- 2. Get and unpack the GSI ----------
-      - name: Download and unpack GSI
+          {
+            echo "RMX3834 stock firmware reference inspection"
+            echo "Expected firmware: RMX3834export_15_H.07"
+            echo "Expected vendor fingerprint: realme/RMX3834/RE5C9F:15/AP3A.240905.015.A2/T.R4T2.1784276895:user/release-keys"
+            echo "Generated: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo
+          } >> "$REPORT"
+
+          # Inspect filesystem partitions. Boot-chain images are recorded separately below.
+          for part in vendor product system_ext odm vendor_dlkm; do
+            IMG="$REF/$part.img"
+            [ -f "$IMG" ] || { echo "::error::Missing required release asset: $part.img"; exit 1; }
+            echo "===== $part.img =====" | tee -a "$REPORT"
+            echo "Original SHA256: $(sha256sum "$IMG" | cut -d' ' -f1)" >> "$REPORT"
+            echo "Original size: $(du -h "$IMG" | cut -f1)" >> "$REPORT"
+            RAW="$REF/$part.raw"
+            unsparse "$IMG" "$RAW"
+            TYPE="$(fstype "$RAW")"
+            echo "Filesystem: $TYPE" | tee -a "$REPORT"
+            if [ "$TYPE" = "unknown" ]; then
+              if [ "$part" = "vendor_dlkm" ]; then
+                echo "vendor_dlkm filesystem not recognized; retained as reference only." >> "$REPORT"
+                rm -f "$RAW"
+                echo >> "$REPORT"
+                continue
+              fi
+              echo "::error::Cannot inspect $part.img: unsupported filesystem"; exit 1
+            fi
+            MNT="$WORK/mnt_ref"
+            sudo mkdir -p "$MNT"
+            mount_img "$RAW" "$MNT"
+            BP="$MNT/build.prop"
+            if [ -f "$BP" ]; then
+              grep -E '^(ro\.(build\.(fingerprint|version\.release|version\.sdk)|vendor\.build\.fingerprint|vndk\.version|product\.vndk\.version)|ro\.product\.first_api_level)=' "$BP" \
+                | tee -a "$REPORT" || true
+            else
+              echo "No root build.prop found." >> "$REPORT"
+            fi
+            echo "VINTF manifests and compatibility matrices:" >> "$REPORT"
+            find "$MNT/etc/vintf" -type f \
+              \( -name '*manifest*.xml' -o -name '*matrix*.xml' \) -print 2>/dev/null \
+              | sed "s#^$MNT/##" | sort | tee -a "$REPORT" || true
+            echo "Relevant configuration paths:" >> "$REPORT"
+            find "$MNT/etc" -maxdepth 3 -type f \
+              \( -iname '*ims*' -o -iname '*carrier*' -o -iname '*telephony*' -o -iname '*bluetooth*' -o -iname '*wifi*' -o -iname '*audio*' -o -iname '*camera*' -o -iname '*fingerprint*' -o -iname '*permissions*.xml' \) \
+              -print 2>/dev/null | sed "s#^$MNT/##" | sort | head -250 | tee -a "$REPORT" || true
+            if [ "$part" = "vendor" ]; then
+              VNDK="$(grep -h '^ro.vndk.version=' "$BP" 2>/dev/null | head -1 | cut -d= -f2 || true)"
+              VFP="$(grep -h '^ro.vendor.build.fingerprint=' "$BP" 2>/dev/null | head -1 | cut -d= -f2 || true)"
+              echo "Vendor VNDK: $VNDK"
+              echo "Vendor fingerprint: $VFP"
+              [ "$VNDK" = "33" ] || { echo "::error::Vendor VNDK is '$VNDK', expected 33"; exit 1; }
+              if [ -n "$PIN" ] && [ "$PIN" != "$VFP" ]; then
+                echo "::error::Vendor fingerprint does not match the requested pin"; exit 1
+              fi
+              if [ "$VFP" != "realme/RMX3834/RE5C9F:15/AP3A.240905.015.A2/T.R4T2.1784276895:user/release-keys" ]; then
+                echo "::error::Vendor fingerprint does not match RMX3834export_15_H.07"; exit 1
+              fi
+              echo "Vendor VNDK: $VNDK" >> "$REPORT"
+              echo "Vendor fingerprint: $VFP" >> "$REPORT"
+            fi
+            if [ "$part" = "vendor_dlkm" ]; then
+              echo "Kernel modules:" >> "$REPORT"
+              find "$MNT" -type f -name '*.ko' -print 2>/dev/null \
+                | sed "s#^$MNT/##" | sort | head -300 | tee -a "$REPORT" || true
+            fi
+            sudo umount "$MNT"
+            rm -f "$RAW"
+            echo >> "$REPORT"
+          done
+
+          # Record boot-chain images without modifying or flashing them.
+          for part in boot vendor_boot dtbo; do
+            IMG="$REF/$part.img"
+            [ -f "$IMG" ] || { echo "::error::Missing required release asset: $part.img"; exit 1; }
+            {
+              echo "===== $part.img (reference only) ====="
+              file "$IMG"
+              stat -c 'Size: %s bytes' "$IMG"
+              sha256sum "$IMG"
+              echo
+            } >> "$REPORT"
+          done
+          cat "$REPORT" >> "$GITHUB_STEP_SUMMARY"
+          # Do not retain multi-GB stock images on the runner after inspection.
+          rm -rf "$REF"
+      - name: Download and inspect GSI (read-only)
         env:
           GSI_URL: ${{ inputs.gsi_url }}
         run: |
+          set -euo pipefail
           source "$WORK/lib.sh"
-          cd "$WORK/dl"
-          aria2c -x16 -s16 -k1M --allow-overwrite=true -o gsi.download "$GSI_URL"
-          mkdir -p x
-          case "$(file -b gsi.download)" in
-            Zip*)        unzip -o -q gsi.download -d x ;;
-            XZ*)         xz -dc gsi.download > x/system.img ;;
-            gzip*)       gzip -dc gsi.download > x/system.img ;;
-            7-zip*)      7z x -y -ox gsi.download >/dev/null ;;
-            *)           mv gsi.download x/system.img ;;
+          mkdir -p "$WORK/gsi" "$WORK/mnt_gsi"
+          cd "$WORK/gsi"
+          aria2c -x8 -s8 -k1M --allow-overwrite=true -o input "$GSI_URL"
+          mkdir extracted
+          KIND="$(file -b input)"
+          case "$KIND" in
+            *Zip*) unzip -oq input -d extracted ;;
+            XZ*) xz -dc input > extracted/system.img ;;
+            gzip*) gzip -dc input > extracted/system.img ;;
+            *7-zip*) 7z x -y -oextracted input >/dev/null ;;
+            *) cp input extracted/system.img ;;
           esac
-          rm -f gsi.download
-          # nested archives (e.g. .img.xz inside a zip)
-          for f in $(find x -type f \( -name '*.xz' -o -name '*.gz' \)); do
-            case "$f" in *.xz) xz -dk "$f" ;; *.gz) gzip -dk "$f" ;; esac
+          find extracted -type f \( -name '*.xz' -o -name '*.gz' \) -print0 | while IFS= read -r -d '' f; do
+            case "$f" in
+              *.xz) xz -dk "$f" ;;
+              *.gz) gzip -dk "$f" ;;
+            esac
           done
-          IMG="$(find x -type f -iname '*.img' -printf '%s %p\n' | sort -rn | head -1 | cut -d' ' -f2-)"
-          [ -n "$IMG" ] || { echo "::error::No .img found in the download"; exit 1; }
-          echo "Using $IMG"
-          unsparse "$IMG" "$WORK/src/system.raw"
-          rm -rf x
-          echo "Source filesystem: $(fstype "$WORK/src/system.raw")"
-
-      # ---------- 3. Copy tree with all xattrs (SELinux labels, capabilities) ----------
-      - name: Extract tree
-        run: |
-          source "$WORK/lib.sh"
-          mount_img "$WORK/src/system.raw" "$WORK/mnt_s"
-          sudo mkdir -p "$WORK/tree"
-          sudo rsync -aHAX --numeric-ids "$WORK/mnt_s"/ "$WORK/tree"/
-          sudo umount "$WORK/mnt_s"
-          rm -f "$WORK/src/system.raw"
-          T="$WORK/tree"
-          if [ -f "$T/system/build.prop" ]; then SYS="$T/system"; else SYS="$T"; fi
-          echo "T=$T" >> "$GITHUB_ENV"
-          echo "SYS=$SYS" >> "$GITHUB_ENV"
-          grep -h -E '^ro\.(system\.)?build\.(version\.release|version\.sdk|fingerprint)=' "$SYS/build.prop" | tee -a "$GITHUB_STEP_SUMMARY"
-
-      # ---------- 4. Optional tweaks, each one its own switch ----------
-      - name: Strip old VNDK apexes
-        if: ${{ inputs.strip_old_vndk }}
-        run: |
-          sudo find "$T" -path '*/apex/*' -regextype posix-extended \
-            -regex '.*/com\.android\.vndk\.v(28|29|30|31|32)(\.apex|\.capex)?$' \
-            -print -exec rm -rf {} + || true
-
-      - name: Strip CJK fonts (files and XML references together)
-        if: ${{ inputs.strip_cjk_fonts }}
-        run: |
-          sudo python3 - "$SYS" <<'PY'
-          import os, sys
-          import xml.etree.ElementTree as ET
-          root = sys.argv[1]
-          fonts = os.path.join(root, "fonts")
-          etc = os.path.join(root, "etc")
-          gone = set()
-          for n in os.listdir(fonts):
-              if "cjk" in n.lower():
-                  os.remove(os.path.join(fonts, n)); gone.add(n)
-          print("removed font files:", sorted(gone))
-          for n in os.listdir(etc):
-              if "font" not in n.lower() or not n.endswith(".xml"):
-                  continue
-              p = os.path.join(etc, n)
-              tree = ET.parse(p)
-              changed = False
-              for fam in list(tree.getroot().iter("family")):
-                  for f in list(fam.findall("font")):
-                      if (f.text or "").strip() in gone:
-                          fam.remove(f); changed = True
-                  if not fam.findall("font"):
-                      tree.getroot().remove(fam); changed = True
-              if changed:
-                  tree.write(p, encoding="utf-8", xml_declaration=True)
-                  print("rewrote", p)
-          PY
-
-      - name: Append extra props
-        if: ${{ inputs.extra_props }}
-        run: |
-          test -f rmx3834/system.prop || { echo "::error::rmx3834/system.prop not found"; exit 1; }
-          { echo; echo "# --- rmx3834 extra props ---"; cat rmx3834/system.prop; } | sudo tee -a "$SYS/build.prop" >/dev/null
-
-      - name: Debloat exact paths
-        if: ${{ inputs.debloat }}
-        run: |
-          test -f rmx3834/debloat.txt || { echo "::error::rmx3834/debloat.txt not found"; exit 1; }
-          while IFS= read -r line; do
-            line="${line%%#*}"; line="$(echo "$line" | xargs)"
-            [ -z "$line" ] && continue
-            case "$line" in *..*|*'*'*|*'?'*|/*) echo "::warning::skipping unsafe line: $line"; continue ;; esac
-            if [ -e "$SYS/$line" ]; then sudo rm -rf "${SYS:?}/$line"; echo "removed $line"; else echo "::warning::not found: $line"; fi
-          done < rmx3834/debloat.txt
-
-      # ---------- 5. Build ----------
-      - name: Build image
-        env:
-          OUT_FS: ${{ inputs.out_fs }}
-        run: |
-          OUT="$WORK/out/system.img"
-          if [ "$OUT_FS" = "erofs" ]; then
-            # Flags match your kernel's probe: big_pcluster + compr_cfgs yes,
-            # ztailpacking / fragments / lzma no.
-            sudo mkfs.erofs -zlz4hc,12 -C16384 "$OUT" "$T"
-          else
-            SIZE=$(( $(sudo du -sm "$T" | cut -f1) * 106 / 100 + 96 ))
-            truncate -s "${SIZE}M" "$OUT"
-            sudo mke2fs -q -t ext4 -b 4096 -L system -m 0 -O ^has_journal -d "$T" "$OUT"
-            sudo e2fsck -fy "$OUT" || true
-            sudo resize2fs -M "$OUT"
-          fi
-          ls -l "$OUT"
-
-      # ---------- 6. Verify before upload ----------
-      - name: Verify image
-        env:
-          MAXMB: ${{ inputs.max_size_mb }}
-        run: |
-          source "$WORK/lib.sh"
-          OUT="$WORK/out/system.img"
-          BYTES=$(stat -c %s "$OUT")
-          if [ "$MAXMB" != "0" ] && [ "$BYTES" -gt $(( MAXMB * 1024 * 1024 )) ]; then
-            echo "::error::system.img is $((BYTES/1024/1024)) MB, limit is $MAXMB MB"; exit 1
-          fi
-          mount_img "$OUT" "$WORK/mnt_o"
-          # build.prop must be present
-          if [ -f "$WORK/mnt_o/system/build.prop" ]; then P="$WORK/mnt_o/system/build.prop"; else P="$WORK/mnt_o/build.prop"; fi
-          test -f "$P"
-          # security.* xattrs (SELinux labels, file capabilities) must match the tree we fed in
-          dump() { (cd "$1" && sudo getfattr -R -h -d -m '^security\.' . 2>/dev/null | LC_ALL=C sort); }
-          dump "$T" > "$WORK/a.txt"
-          dump "$WORK/mnt_o" > "$WORK/b.txt"
-          if diff -q "$WORK/a.txt" "$WORK/b.txt" >/dev/null; then
-            echo "security xattrs identical ($(wc -l < "$WORK/a.txt") lines)"
-          else
-            diff "$WORK/a.txt" "$WORK/b.txt" | head -40
-            echo "::error::security xattrs differ between tree and built image"; exit 1
-          fi
-          sudo umount "$WORK/mnt_o"
-          sha256sum "$OUT" | tee "$WORK/out/system.img.sha256"
+          IMG="$(find extracted -type f -iname '*.img' -printf '%s %p\n' | sort -rn | head -1 | cut -d' ' -f2-)"
+          [ -n "$IMG" ] || { echo 'No .img found in GSI archive' >&2; exit 1; }
+          unsparse "$IMG" "$WORK/gsi/system.raw"
+          TYPE="$(fstype "$WORK/gsi/system.raw")"
+          echo "GSI image: $IMG" >> "$WORK/out/stock-compatibility-report.txt"
+          echo "GSI filesystem: $TYPE" >> "$WORK/out/stock-compatibility-report.txt"
+          mount_img "$WORK/gsi/system.raw" "$WORK/mnt_gsi"
+          M="$WORK/mnt_gsi"
+          P="$M/build.prop"; [ -f "$P" ] || P="$M/system/build.prop"
           {
-            echo "### Output"
-            echo "- Size: $((BYTES/1024/1024)) MB"
-            echo "- SHA256: \`$(cut -d' ' -f1 "$WORK/out/system.img.sha256")\`"
-          } >> "$GITHUB_STEP_SUMMARY"
-          cat > "$WORK/out/FLASH.txt" <<'TXT'
-          Flash (fastbootd, because system is a logical partition):
-            adb reboot fastboot
-            fastboot --disable-verity --disable-verification flash vbmeta_a vbmeta.img   # your stock vbmeta.img
-            fastboot flash system_a system.img
-            fastboot -w
-          Stock product, system_ext, odm and vendor are NOT touched.
-          Keep a stock system.img ready.
-          TXT
+            echo
+            echo '===== GSI system image (read-only inspection) ====='
+            echo "Build properties file: ${P#"$M"/}"
+            if [ -f "$P" ]; then
+              grep -E '^(ro\.(build\.(fingerprint|version\.release|version\.sdk)|product\.|system\.|vendor\.)|ro\.vndk)' "$P" | sort || true
+            else
+              echo 'No build.prop found at expected locations.'
+            fi
+            echo
+            echo 'VINTF files:'
+            find "$M" -type f -path '*/etc/vintf/*' \( -name '*.xml' -o -name '*.json' \) -printf '%P\n' 2>/dev/null | sort | head -400 || true
+            echo
+            echo 'Overlay directories / overlay APKs:'
+            find "$M" \( -type d -iname '*overlay*' -o -type f -iname '*overlay*.apk' \) -printf '%P\n' 2>/dev/null | sort | head -400 || true
+            echo
+            echo 'Permission and feature XML files:'
+            find "$M" -type f \( -path '*/etc/permissions/*.xml' -o -path '*/etc/sysconfig/*.xml' \) -printf '%P\n' 2>/dev/null | sort | head -600 || true
+            echo
+            echo 'Init rc files:'
+            find "$M" -type f -name '*.rc' -printf '%P\n' 2>/dev/null | sort | head -500 || true
+            echo
+            echo 'Radio / IMS / Bluetooth / Wi-Fi / camera / audio related paths:'
+            find "$M" -type f \( -iname '*ims*' -o -iname '*radio*' -o -iname '*ril*' -o -iname '*bluetooth*' -o -iname '*wifi*' -o -iname '*camera*' -o -iname '*audio*' -o -iname '*gnss*' -o -iname '*fingerprint*' \) -printf '%P\n' 2>/dev/null | sort | head -800 || true
+            echo
+            echo '===== End GSI inspection ====='
+          } >> "$WORK/out/stock-compatibility-report.txt"
+          sudo umount "$M"
+          rm -rf "$WORK/gsi" "$WORK/mnt_gsi"
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload report only
+        uses: actions/upload-artifact@v4
         with:
-          name: rmx3834-system
-          path: |
-            /work/out/system.img
-            /work/out/system.img.sha256
-            /work/out/FLASH.txt
-          compression-level: 0
-          retention-days: 7
+          name: rmx3834-compatibility-report
+          path: /work/out/stock-compatibility-report.txt
+          if-no-files-found: error
+          retention-days: 14
