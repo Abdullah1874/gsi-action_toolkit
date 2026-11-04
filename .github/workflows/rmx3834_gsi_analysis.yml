@@ -1,0 +1,287 @@
+name: RMX3834 + crDroid 12.12 GAPPS compatibility analysis
+
+on:
+  workflow_dispatch:
+    inputs:
+      gsi_url:
+        description: "crDroid 12.12 Android 16 GAPPS image URL (pre-filled; change only if needed)"
+        required: true
+        type: string
+        default: "https://github.com/Doze-off/crdroid_gsi_treble/releases/download/2026-09-22/crDroid-12.12-GSI_treble_arm64-ab-GAPPS-20260922.img.xz"
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  DEVICE_TAG: device-Realme-Note-50
+  WORK: /work
+  EXPECTED_VENDOR_FP: "realme/RMX3834/RE5C9F:15/AP3A.240905.015.A2/T.R4T2.1784276895:user/release-keys"
+
+jobs:
+  analyze:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install inspection tools
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq aria2 erofs-utils e2fsprogs xz-utils \
+            unzip p7zip-full file python3 python3-lxml xxd android-sdk-libsparse-utils
+          sudo mkdir -p "$WORK"/{ref,gsi,mnt,out}
+          sudo chown -R "$USER" "$WORK"
+
+      - name: Download stock reference partitions
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download "$DEVICE_TAG" --repo "$GITHUB_REPOSITORY" \
+            -p 'vendor.img' -p 'product.img' -p 'system_ext.img' -p 'odm.img' \
+            -D "$WORK/ref"
+          for p in vendor product system_ext odm; do
+            test -s "$WORK/ref/$p.img" || { echo "::error::Missing stock reference $p.img"; exit 1; }
+          done
+
+      - name: Download and unpack exact crDroid GAPPS GSI
+        env:
+          GSI_URL: ${{ inputs.gsi_url }}
+        run: |
+          set -euo pipefail
+          aria2c -x8 -s8 -k1M --allow-overwrite=true \
+            --file-allocation=none -d "$WORK/gsi" -o crdroid-gapps.img.xz "$GSI_URL"
+          xz -t "$WORK/gsi/crdroid-gapps.img.xz"
+          xz -dc "$WORK/gsi/crdroid-gapps.img.xz" > "$WORK/gsi/system.img"
+          test -s "$WORK/gsi/system.img"
+
+      - name: Inspect and compare firmware and GSI (read-only)
+        run: |
+          set -euo pipefail
+          cat > "$WORK/analyze.py" <<'PY'
+          import os, re, sys, json, hashlib, subprocess, pathlib, xml.etree.ElementTree as ET
+          from collections import Counter, defaultdict
+
+          W = pathlib.Path("/work")
+          OUT = W / "out" / "rmx3834-crdroid12-gapps-analysis.txt"
+          MNT = W / "mnt"
+          EXPECTED = os.environ["EXPECTED_VENDOR_FP"]
+          REPORT = []
+
+          def add(s=""): REPORT.append(str(s))
+          def run(cmd):
+              return subprocess.run(cmd, text=True, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, check=False)
+
+          def fs_type(p):
+              with open(p, "rb") as f:
+                  f.seek(1024); a=f.read(4)
+                  f.seek(1080); b=f.read(2)
+              if a == bytes.fromhex("e2e1f5e0"): return "erofs"
+              if b == bytes.fromhex("53ef"): return "ext4"
+              return "unknown"
+
+          def mount_image(img, name):
+              raw = W / (name + ".raw")
+              # Android sparse image magic
+              with open(img, "rb") as f: magic=f.read(4)
+              if magic == bytes.fromhex("3aff26ed"):
+                  # unsparse with Android sparse utility if available
+                  r=run([" simg2img ".strip(), str(img), str(raw)])
+                  if r.returncode != 0:
+                      raise RuntimeError("simg2img failed for " + str(img) + ": " + r.stderr)
+              else:
+                  raw = pathlib.Path(img)
+              typ=fs_type(raw)
+              if typ not in ("erofs","ext4"):
+                  raise RuntimeError(f"Unsupported filesystem {typ}: {img}")
+              MNT.mkdir(exist_ok=True)
+              r=run(["sudo","mount","-t",typ,"-o","ro,loop" + (",noload" if typ=="ext4" else ""),str(raw),str(MNT)])
+              if r.returncode: raise RuntimeError("mount failed: "+r.stderr)
+              return raw, typ
+
+          def unmount():
+              run(["sudo","umount",str(MNT)])
+
+          def prop_files(root):
+              return sorted(root.rglob("*.prop"))
+
+          def parse_props(root):
+              out=defaultdict(list)
+              for f in prop_files(root):
+                  try:
+                      for line in f.read_text(errors="ignore").splitlines():
+                          line=line.strip()
+                          if not line or line.startswith("#") or "=" not in line: continue
+                          k,v=line.split("=",1)
+                          if k.startswith(("ro.","persist.")):
+                              out[k].append((str(f.relative_to(root)),v))
+                  except OSError: pass
+              return out
+
+          def xml_files(root):
+              return sorted(root.rglob("*.xml"))
+
+          def localname(tag): return tag.rsplit("}",1)[-1]
+
+          def parse_vintf(root):
+              entries=set(); files=[]; errors=[]
+              for f in xml_files(root):
+                  rel=str(f.relative_to(root))
+                  if "/vintf/" not in "/" + rel and not rel.startswith("etc/vintf/"): continue
+                  try:
+                      tree=ET.parse(f)
+                      files.append(rel)
+                      for el in tree.iter():
+                          tag=localname(el.tag)
+                          if tag in ("hal","fqname","name","version","interface","instance","transport","arch","kernel","sepolicy"):
+                              attrs=" ".join(f"{k}={v}" for k,v in sorted(el.attrib.items()))
+                              txt=(el.text or "").strip()
+                              if tag=="hal":
+                                  name=next((x.text.strip() for x in el if localname(x.tag)=="name" and x.text),"")
+                                  vers=[x.text.strip() for x in el if localname(x.tag)=="version" and x.text]
+                                  ints=[]
+                                  for x in el:
+                                      if localname(x.tag)=="interface":
+                                          iname=next((z.text.strip() for z in x if localname(z.tag)=="name" and z.text),"")
+                                          inst=[z.text.strip() for z in x if localname(z.tag)=="instance" and z.text]
+                                          ints += [f"{iname}/{i}" for i in inst]
+                                  entries.add(("HAL",name,",".join(vers),",".join(ints),attrs,rel))
+                              elif tag=="fqname" and txt: entries.add(("FQNAME",txt,"","","",rel))
+                  except Exception as e:
+                      errors.append(f"{rel}: {e}")
+              return entries,files,errors
+
+          def selected_device_profile(props):
+              candidates=[]
+              for k,vals in props.items():
+                  if k=="ro.vendor.build.fingerprint":
+                      for path,val in vals:
+                          if "RMX3834" in val or "RE5C9F" in val:
+                              candidates.append((path,val))
+              return candidates
+
+          add("RMX3834 / crDroid 12.12 GAPPS Android 16 compatibility analysis")
+          add("Mode: READ-ONLY. No stock images or GSI contents are modified.")
+          add("Target stock firmware: RMX3834export_15_H.07")
+          add("Expected device fingerprint: "+EXPECTED)
+          add("Generated UTC: "+subprocess.check_output(["date","-u","+%Y-%m-%d %H:%M:%S"],text=True).strip())
+          add("")
+          add("IMPORTANT: Static inspection cannot prove runtime functionality. DSU/device testing remains required.")
+          add("")
+
+          stock_vintf=set()
+          stock_props={}
+          for part in ("vendor","product","system_ext","odm"):
+              img=W/"ref"/(part+".img")
+              raw,typ=mount_image(img, "stock_"+part)
+              root=MNT
+              props=parse_props(root)
+              v,files,errors=parse_vintf(root)
+              add(f"===== STOCK {part.upper()} =====")
+              add(f"Filesystem: {typ}; image size: {img.stat().st_size} bytes")
+              add(f"Property files found: {len(prop_files(root))}")
+              if part=="vendor":
+                  profiles=selected_device_profile(props)
+                  add("RMX3834-specific vendor fingerprints:")
+                  if profiles:
+                      for path,val in profiles: add(f"  {path}: {val}")
+                  else: add("  NONE FOUND")
+                  add("VNDK-related properties:")
+                  found=False
+                  for k in ("ro.vndk.version","ro.vendor.vndk.version","ro.product.vndk.version","ro.product.first_api_level"):
+                      for path,val in props.get(k,[]):
+                          found=True; add(f"  {path}: {k}={val}")
+                  if not found: add("  Not present in scanned property files; runtime getprop may be populated elsewhere.")
+              add(f"VINTF XML files parsed: {len(files)}; declarations: {len(v)}; parse errors: {len(errors)}")
+              for x in sorted(v): add("  "+" | ".join(x))
+              for e in errors: add("  XML_PARSE_WARNING: "+e)
+              if part in ("vendor","odm"): stock_vintf |= v
+              stock_props[part]=props
+              unmount()
+              if raw != img: raw.unlink(missing_ok=True)
+              add("")
+
+          # GSI image
+          img=W/"gsi"/"system.img"
+          raw,typ=mount_image(img,"gsi_system")
+          root=MNT
+          props=parse_props(root)
+          gv,gfiles,gerrors=parse_vintf(root)
+          add("===== CRDROID GSI SYSTEM =====")
+          add(f"Filesystem: {typ}; image size: {img.stat().st_size} bytes")
+          add(f"Property files found: {len(prop_files(root))}")
+          add("Selected build properties:")
+          keys=("ro.build.fingerprint","ro.build.version.release","ro.build.version.sdk",
+                "ro.build.version.security_patch","ro.product.cpu.abilist","ro.product.device",
+                "ro.product.name","ro.product.brand","ro.vndk.version","ro.product.vndk.version",
+                "ro.system.build.fingerprint","ro.system_ext.build.fingerprint")
+          for k in keys:
+              for path,val in props.get(k,[]): add(f"  {path}: {k}={val}")
+          add(f"VINTF XML files parsed: {len(gfiles)}; declarations: {len(gv)}; parse errors: {len(gerrors)}")
+          for x in sorted(gv): add("  "+" | ".join(x))
+          for e in gerrors: add("  XML_PARSE_WARNING: "+e)
+          add("")
+          add("===== VINTF DECLARATION COMPARISON =====")
+          # Exact normalized tuple matching is a triage aid, not a formal VINTF compatibility check.
+          stock_keys={(x[0],x[1],x[2],x[3]) for x in stock_vintf}
+          gsi_keys={(x[0],x[1],x[2],x[3]) for x in gv}
+          add("Stock vendor/ODM declaration count: "+str(len(stock_keys)))
+          add("GSI system declaration count: "+str(len(gsi_keys)))
+          add("Declarations with exact matching tuple in both sides: "+str(len(stock_keys & gsi_keys)))
+          add("Stock vendor/ODM declarations not duplicated in GSI system (not automatically a conflict):")
+          for x in sorted(stock_keys-gsi_keys): add("  "+" | ".join(x))
+          add("GSI system declarations not duplicated in stock vendor/ODM (not automatically a conflict):")
+          for x in sorted(gsi_keys-stock_keys): add("  "+" | ".join(x))
+          add("")
+          add("===== GSI CONFIGURATION INVENTORY =====")
+          categories={
+            "IMS / radio / telephony":r"(ims|radio|ril|telephony|carrier|euicc)",
+            "Bluetooth":r"(bluetooth|a2dp|bt_audio)",
+            "Wi-Fi":r"(wifi|wlan|supplicant|hostapd)",
+            "Camera":r"(camera|camx)",
+            "Audio":r"(audio|sound|codec|media_codecs)",
+            "Biometrics":r"(fingerprint|biometric|face)",
+            "GNSS / sensors":r"(gnss|gps|sensor)",
+            "Overlays":r"(overlay|\\.apk$)"
+          }
+          allfiles=[str(p.relative_to(root)) for p in root.rglob("*") if p.is_file()]
+          for label,pattern in categories.items():
+              matches=[p for p in allfiles if re.search(pattern,p,re.I)]
+              add(label+":")
+              for p in matches[:250]: add("  "+p)
+              if len(matches)>250: add(f"  ... {len(matches)-250} additional paths omitted")
+          add("")
+          add("===== VINTF FILE INVENTORY =====")
+          for p in gfiles: add("  "+p)
+          add("")
+          add("===== ANALYSIS LIMITATIONS / NEXT ACTIONS =====")
+          add("- This report inventories and compares declarations; it is not a full Android VINTF compatibility-matrix solver.")
+          add("- A declaration present on only one side is not automatically an error; manifests and matrices have different roles.")
+          add("- Runtime properties may be supplied by bootconfig, init, vendor_boot, or property contexts and may not appear in a partition .prop file.")
+          add("- No vendor, product, system_ext, odm, boot, vendor_boot, dtbo, modem, or other stock partition is modified.")
+          add("- Do not remove HALs, overlays, VNDK/APEX packages, permissions, or libraries based only on this inventory.")
+          add("- Next step: review concrete XML/property findings, then make only justified system.img changes and test with DSU.")
+          unmount()
+          if raw != img: raw.unlink(missing_ok=True)
+
+          OUT.write_text("\n".join(REPORT)+"\n")
+          print(f"Wrote {OUT} ({OUT.stat().st_size} bytes)")
+          PY
+          sudo python3 "$WORK/analyze.py"
+          cat "$WORK/out/rmx3834-crdroid12-gapps-analysis.txt" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload compatibility analysis report
+        uses: actions/upload-artifact@v4
+        with:
+          name: rmx3834-crdroid12-gapps-analysis
+          path: /work/out/rmx3834-crdroid12-gapps-analysis.txt
+          if-no-files-found: error
+          retention-days: 14
