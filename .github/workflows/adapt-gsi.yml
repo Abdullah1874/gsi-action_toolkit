@@ -1,4 +1,3 @@
-
 name: Adapt GSI to a device
 
 # Device-profile driven GSI adaptation.
@@ -1256,7 +1255,7 @@ jobs:
         continue-on-error: true
         run: |
           for a in $ASSETS; do python3 "$TOOLS/props_report.py" --label "$a" --root "$WORK/stock/$a" --out "$REPORT" --model "$MODEL_NUM" | tee -a "$REPORT/summary.txt"; done
-          python3 "$TOOLS/props_report.py" --label gsi --root "$WORK/gsi_mnt" --out "$REPORT" | tee -a "$REPORT/summary.txt"
+          sudo python3 "$TOOLS/props_report.py" --label gsi --root "$WORK/gsi_mnt" --out "$REPORT" | tee -a "$REPORT/summary.txt"
 
       - name: VINTF compatibility
         id: vintf
@@ -1264,7 +1263,7 @@ jobs:
         run: |
           ROOTS="vendor=$WORK/stock/vendor"
           [ -d "$WORK/stock/odm" ] && ROOTS="$ROOTS odm=$WORK/stock/odm"
-          python3 "$TOOLS/vintf_check.py" --device-roots $ROOTS --gsi-root "$WORK/gsi_mnt" --out "$REPORT" --target-level "$TARGET_LEVEL" | tee -a "$REPORT/summary.txt"
+          sudo python3 "$TOOLS/vintf_check.py" --device-roots $ROOTS --gsi-root "$WORK/gsi_mnt" --out "$REPORT" --target-level "$TARGET_LEVEL" | tee -a "$REPORT/summary.txt"
 
       - name: Init services
         id: rc
@@ -1272,7 +1271,7 @@ jobs:
         run: |
           R=""
           for a in $ASSETS; do R="$R $a=$WORK/stock/$a"; done
-          python3 "$TOOLS/rc_report.py" --roots $R gsi="$WORK/gsi_mnt" --out "$REPORT" | tee -a "$REPORT/summary.txt"
+          sudo python3 "$TOOLS/rc_report.py" --roots $R gsi="$WORK/gsi_mnt" --out "$REPORT" | tee -a "$REPORT/summary.txt"
 
       - name: Overlay audit
         id: overlays
@@ -1280,12 +1279,12 @@ jobs:
         run: |
           R=""
           for a in $ASSETS; do R="$R $a=$WORK/stock/$a"; done
-          python3 "$TOOLS/overlay_audit.py" --target-apk "$WORK/gsi_mnt/system/framework/framework-res.apk" --scan $R gsi="$WORK/gsi_mnt" --out "$REPORT" | tee -a "$REPORT/summary.txt"
+          sudo python3 "$TOOLS/overlay_audit.py" --target-apk "$WORK/gsi_mnt/system/framework/framework-res.apk" --scan $R gsi="$WORK/gsi_mnt" --out "$REPORT" | tee -a "$REPORT/summary.txt"
 
       - name: SELinux facts
         id: selinux
         continue-on-error: true
-        run: python3 "$TOOLS/selinux_check.py" --vendor "$WORK/stock/vendor" --gsi "$WORK/gsi_mnt" --out "$REPORT" | tee -a "$REPORT/summary.txt"
+        run: sudo python3 "$TOOLS/selinux_check.py" --vendor "$WORK/stock/vendor" --gsi "$WORK/gsi_mnt" --out "$REPORT" | tee -a "$REPORT/summary.txt"
 
       - name: Device configs and listings
         id: configs
@@ -1293,7 +1292,7 @@ jobs:
         run: |
           R=""
           for a in $ASSETS; do R="$R $a=$WORK/stock/$a"; done
-          python3 "$TOOLS/configs_report.py" --roots $R gsi="$WORK/gsi_mnt" --out "$REPORT" | tee -a "$REPORT/summary.txt"
+          sudo python3 "$TOOLS/configs_report.py" --roots $R gsi="$WORK/gsi_mnt" --out "$REPORT" | tee -a "$REPORT/summary.txt"
 
       - name: VNDK dependency check
         id: vndk
@@ -1427,6 +1426,10 @@ jobs:
         run: |
           for m in "$WORK"/mnt_out "$WORK"/gsi_mnt "$WORK"/stock/*/; do sudo umount "$m" 2>/dev/null || true; done
           sudo losetup -D || true
+
+      - name: Fix report ownership
+        if: always()
+        run: sudo chown -R "$USER" "$REPORT" || true
 
       - name: Upload reports
         if: always()
