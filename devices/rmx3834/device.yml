@@ -1,1 +1,46 @@
 
+# Device profile: Realme Note 50 (RMX3834).
+# Every value below is backed by a file you uploaded; the source is named in the comment.
+# Add a new device by copying this folder to devices/<id>/ and editing the values.
+
+device:
+  id: rmx3834
+  name: Realme Note 50
+  model_number: "3834"            # used to pick the RMX3834 SKU variant prop files (build_<SKU>_3834.prop)
+  soc: Unisoc T612 (ums9230_hulk)
+
+stock:
+  release_tag: device-Realme-Note-50          # GitHub release in this repository that holds the stock images
+  firmware: RMX3834export_15_H.07             # probe.txt
+  fingerprint: "realme/RMX3834/RE5C9F:15/AP3A.240905.015.A2/T.R4T2.1784276895:user/release-keys"   # probe.txt
+  android_release: 15
+  vendor_android_release: 13                  # probe.txt: ro.vendor.build.version.release=13
+  vndk: 33                                    # probe.txt: ro.vndk.version=33 (live phone; NOT found in the released vendor.img props, see provenance report)
+  vintf_target_level: 7                       # assumption: Android 13 vendor = FCM level 7. The audit reports what the manifests declare.
+  assets: [vendor, product, system_ext, odm]  # images analysed (must exist in the release as <name>.img)
+
+kernel:
+  version: 5.15.189
+  erofs:
+    # probe.txt: /sys/fs/erofs/features = big_pcluster chunked_file compr_cfgs compr_head2 device_table sb_chksum zero_padding
+    # NOT supported: ztailpacking, fragments, lzma. Do not add them.
+    mkfs_args: ["-zlz4hc,12", "-C16384"]
+
+size_limit_mb: 0     # set to the size of system_a from `lpdump` (or the DSU limit) to make the build refuse an oversized image
+
+# Adaptation modules. Nothing is enabled until the audit or DSU logs justify it.
+# Each module needs: id, type, evidence, why, android16, test.  Types:
+#   props            file: system/build.prop            set: {key: value}
+#   remove_paths     paths: [exact/relative/path, ...]
+#   copy_from_stock  from: vendor|odm|product|system_ext   src: etc/x.xml   dst: system/etc/x.xml   like: <existing GSI file to clone owner/mode/SELinux label from>
+# Remove a module (or set enabled: false) and rebuild to reverse it. The original GSI is never modified.
+modules: []
+#  - id: example
+#    enabled: false
+#    type: props
+#    file: system/build.prop
+#    set: {some.property: "value"}
+#    evidence: "which stock file / log line shows this is needed"
+#    why: "what it fixes"
+#    android16: "how you verified Android 16 accepts it"
+#    test: "how you will test it on the RMX3834 under DSU"
